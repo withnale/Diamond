@@ -44,7 +44,7 @@ import datetime
 import functools
 import re
 import time
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from string import Template
 
 import diamond.collector
@@ -158,6 +158,45 @@ class ElbCollector(diamond.collector.Collector):
             # the creds from the instance metatdata.
             self.auth_kwargs = {}
 
+        # Default to retry metrics for 15 mins and then stop querying metrics
+        # and requery API every 15 mins until ELB is found
+        backoff_list = self.config.get('backoff', '900:900')
+        elb.backoff = {}
+        for item in backoff_list:
+            (k,v) = item.split(':')
+            # Both k and v should be multiples of interval
+            elb.backoff[int(k)] = int(v)
+
+        # Load the static ELB definitions
+        self.elbs_by_region = defaultdict(list)
+        if 'static' in self.config:
+            self.collect_static()
+
+    # returns True if the test is explicitly disabled this cycle
+    # returns False if the test should go ahead this cycle
+    #    including possible API get_by_tags lookups
+    # returns None if the test should go ahead this cycle
+    #    excluding possible API get_by_tags lookups
+    def is_subdued(self, elb, starttime):
+        # If it didn't fail last time we won't need to redo get_by_tags
+        if elb['last_fail'] == None:
+            return None
+
+        diff = starttime - elb['last_fail']
+        candidates = [item for item in elb.backoff.keys() if item > diff]
+        # If no candidates are found it means we are in the period before
+        # the backoff takes effect and should just try the metric again
+        if candidates.size == 0:
+            return None
+        interval = max()
+        x1 = diff - interval
+        x2 = x1 % elb.backoff[interval]
+        # We assume our backoff rules match up with interval boundaries
+        if x2 == 0:
+            return False
+        else:
+            return True
+
     def check_boto(self):
         if not cloudwatch:
             self.log.error("boto module not found!")
@@ -199,7 +238,7 @@ class ElbCollector(diamond.collector.Collector):
         # Publish Metric
         self.publish_metric(metric)
 
-    def get_elb_names(self, region, config):
+    def get_elb_names_from_list(self, region, config):
         """
         :param region: name of a region
         :param config: Collector config dict
@@ -224,16 +263,29 @@ class ElbCollector(diamond.collector.Collector):
             for elb_name in full_elb_names:
                 if matchers and any([m.match(elb_name) for m in matchers]):
                     continue
-                elb_names.append(elb_name)
+                elb_names.append({ 'name': elb_name })
         else:
             elb_names = region_dict['elb_names']
-        return elb_names
+            if type(elb_names) is str:
+                elb_names = [ elb_names ]
 
-    def process_stat(self, region, zone, elb_name, metric, stat, end_time):
+        # We actually want a dict of items based on the string names
+        return [dict({"name": elem}) for elem in elb_names]
+
+
+    def get_elb_names(self, region, config):
+        # Get any ELBs listed by region
+        elbs = self.get_elb_names_from_list(region, config)
+        # Add any statically defined ELBs
+        elbs += self.elbs_by_region.get(region, [])
+        return elbs
+        #get_elb_names_from_static(region, config)
+
+    def process_stat(self, region, zone, elb_logical_name, metric, stat, end_time):
         template_tokens = {
             'region': region,
             'zone': zone,
-            'elb_name': elb_name,
+            'elb_name': elb_logical_name,
             'metric_name': metric.name,
         }
         name_template = Template(self.config['format'])
@@ -246,7 +298,11 @@ class ElbCollector(diamond.collector.Collector):
             timestamp=time.mktime(utc_to_local(end_time).timetuple()))
 
     def process_metric(self, region_cw_conn, zone, start_time, end_time,
-                       elb_name, metric):
+                       elb, metric):
+        has_data = True
+        elb_logical_name = elb.get('name')
+        elb_aws_name = elb.get('aws_name', elb_logical_name)
+
         stats = region_cw_conn.get_metric_statistics(
             self.config['interval'],
             start_time,
@@ -255,40 +311,141 @@ class ElbCollector(diamond.collector.Collector):
             namespace='AWS/ELB',
             statistics=[metric.aws_type],
             dimensions={
-                'LoadBalancerName': elb_name,
+                'LoadBalancerName': elb_aws_name,
                 'AvailabilityZone': zone
             })
 
         # create a fake stat if the current metric should default to zero when
         # a stat is not returned. Cloudwatch just skips the metric entirely
         # instead of wasting space to store/emit a zero.
-        if len(stats) == 0 and metric.default_to_zero:
-            stats.append({
-                u'Timestamp': start_time,
-                metric.aws_type: 0.0,
-                u'Unit': u'Count'
-            })
+        if len(stats) == 0:
+            has_data = False
+            if metric.default_to_zero:
+                stats.append({
+                    u'Timestamp': start_time,
+                    metric.aws_type: 0.0,
+                    u'Unit': u'Count'
+                })
 
         for stat in stats:
-            self.process_stat(region_cw_conn.region.name, zone, elb_name,
+            self.process_stat(region_cw_conn.region.name, zone, elb_logical_name,
                               metric, stat, end_time)
 
-    def process_elb(self, region_cw_conn, zone, start_time, end_time, elb_name):
-        for metric in self.metrics:
-            self.process_metric(region_cw_conn, zone, start_time, end_time,
-                                elb_name, metric)
+        self.log.info("process_metric: returning - {} has_data={}".format(elb_logical_name, has_data))
+        return has_data
 
-    def process_zone(self, region_cw_conn, zone, start_time, end_time):
-        for elb_name in self.get_elb_names(region_cw_conn.region.name,
+
+    def process_zone1(self, region_cw_conn, zone, start_time, end_time):
+        self.log.info("Checking zone %s" % (zone))
+        for elb in self.get_elb_names(region_cw_conn.region.name,
                                            self.config):
             self.process_elb(region_cw_conn, zone, start_time, end_time,
-                             elb_name)
+                             elb)
 
-    def process_region(self, region_cw_conn, start_time, end_time):
+
+    def process_elb1(self, region_cw_conn, zone, start_time, end_time, elb):
+        result = True
+        for metric in [ self.metrics[1] ]:
+            has_data = self.process_metric(region_cw_conn, zone, start_time, end_time,
+                                elb, metric)
+            result = result and has_data
+
+        # If none of the metrics in any region has returned data
+        # we should mark this as failed
+        if result == False:
+                self.log.warn("Marking as failed - %s" % (elb.get('name')))
+                elb['last_fail'] = start_time
+
+
+
+
+
+    def process_region1(self, region_cw_conn, start_time, end_time):
+        self.log.info("process_region")
+
         for zone in get_zones(region_cw_conn.region.name, self.auth_kwargs):
             self.process_zone(region_cw_conn, zone, start_time, end_time)
 
+
+
+
+    def process_zone(self, region_cw_conn, elb, zone, start_time, end_time):
+        self.log.info("Checking zone %s" % (zone))
+        result = True
+        for metric in [ self.metrics[1] ]:
+            has_data = self.process_metric(region_cw_conn, zone, start_time, end_time,
+                        elb, metric)
+            result = result and has_data
+        self.log.info("process_zone: returning - {} has_data={}".format(elb.get('name'), result))
+        return result
+
+
+
+    def process_elb(self, region_cw_conn, elb, start_time, end_time):
+        result = True
+
+        if elb.get('last_fail') != None:
+            self.log.warn("Skipping due to failure - %s" % (elb.get('name')))
+            return
+
+        for zone in get_zones(region_cw_conn.region.name, self.auth_kwargs):
+            has_data = self.process_zone(region_cw_conn, elb, zone, start_time, end_time)
+            result = result and has_data
+
+        # If none of the metrics in any region has returned data
+        # we should mark this as failed
+        if result == False:
+            elb['last_fail'] = start_time
+        else:
+            elb['last_fail'] = None
+        self.log.info("process_elb: returning - {} has_data={}".format(elb.get('name'), elb.get('last_fail')))
+
+
+
+
+
+    def process_region(self, region_cw_conn, start_time, end_time):
+        self.log.info("process_region")
+        for elb in self.get_elb_names(region_cw_conn.region.name, self.config):
+            self.process_elb(region_cw_conn, elb, start_time, end_time)
+
+
+
+    def collect_regions(self, start_time, end_time):
+
+        unique_regions = self.config.get('regions').keys() + self.elbs_by_region.keys()
+        for region in set(unique_regions):
+            self.log.info("Connecting to region %s" % (region))
+            region_cw_conn = cloudwatch.connect_to_region(region,
+                                                          **self.auth_kwargs)
+            self.process_region(region_cw_conn, start_time, end_time)
+
+
+    def collect_static(self):
+        self.log.info(self.config['static'])
+
+        for static_name in self.config['static'].keys():
+            self.log.info("Found static_name=%s" % static_name)
+            self.log.info(self.config['static'][static_name])
+
+            region = self.config['static'][static_name].get('region', 'eu-west-1')
+            if 'name' in self.config['static'][static_name]:
+               name = self.config['static'][static_name]['name']
+               self.log.info("Finding LB %s by name %s in region %s" %
+                            (static_name, name, region))
+               self.elbs_by_region[region].append({'name': static_name, 'aws_name': name})
+            elif 'tags' in self.config['static'][static_name]:
+               tags = self.config['static'][static_name]['tags']
+               self.log.info("Finding LB %s by tags %s in region %s" %
+                             (static_name, tags, region))
+               self.elbs_by_region[region].append({'name': static_name, 'tags': tags})
+            else:
+               self.log.info("You must specify either tags or name for static ELBs")
+
+        self.log.info(self.elbs_by_region)
+
     def collect(self):
+        self.log.info("\n\nCollecting")
         if not self.check_boto():
             return
 
@@ -296,7 +453,8 @@ class ElbCollector(diamond.collector.Collector):
         end_time = now.replace(second=0, microsecond=0)
         start_time = end_time - datetime.timedelta(seconds=self.interval)
 
-        for region in self.config['regions'].keys():
-            region_cw_conn = cloudwatch.connect_to_region(region,
-                                                          **self.auth_kwargs)
-            self.process_region(region_cw_conn, start_time, end_time)
+        #self.log.info(repr(self.config))
+        self.collect_regions(start_time, end_time)
+
+
+
